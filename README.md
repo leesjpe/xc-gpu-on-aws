@@ -1,5 +1,3 @@
-> **핵심:** NVIDIA GPU (P4d, P5 등) 워크로드 전용
-
 # XC GPU on AWS ⚡
 
 Dedicated resources for running **NVIDIA GPU** workloads on AWS Accelerated Computing instances (P5, P4d, G5, etc.).
