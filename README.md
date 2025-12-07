@@ -1,4 +1,3 @@
-### `xc-gpu-on-aws`
 > **핵심:** NVIDIA GPU (P4d, P5 등) 워크로드 전용
 
 # XC GPU on AWS ⚡
