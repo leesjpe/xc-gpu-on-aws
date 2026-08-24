@@ -6,7 +6,7 @@ GPU 인스턴스(P5, P5en, P6-B300, Trn2 등)의 Capacity Block 가용 슬롯을
 
 
 
-[Architecture](architecture.svg)
+![Architecture](architecture.svg)
 
 ```
 EventBridge (4시간 간격)
