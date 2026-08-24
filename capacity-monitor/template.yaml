@@ -1,0 +1,300 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Multi-target Capacity Blocks Monitor.
+  Checks CB availability for multiple instance types across regions.
+  Sends alerts via SNS → AWS Chatbot → Slack.
+
+Parameters:
+  SnsTopicArn:
+    Type: String
+    Default: "arn:aws:sns:ap-northeast-2:019036800568:gpu-cb-alert-icn"
+    Description: "Cross-account SNS Topic ARN (in 019036800568)"
+  CheckIntervalMinutes:
+    Type: Number
+    Default: 240
+    Description: "How often to check (minutes)"
+
+Resources:
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: gpu-cb-monitor-lambda-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: EC2DescribeCapacityBlocks
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - ec2:DescribeCapacityBlockOfferings
+                Resource: "*"
+        - PolicyName: SNSPublish
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - sns:Publish
+                Resource: !Ref SnsTopicArn
+
+  CBMonitorFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: gpu-cb-monitor-multi
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 600
+      MemorySize: 256
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref SnsTopicArn
+          TARGETS: >
+            [
+              {"region": "ap-northeast-2", "instance_type": "p5en.48xlarge", "label": "서울 p5en"},
+              {"region": "us-east-2", "instance_type": "trn2.48xlarge", "label": "Ohio Trn2-48xl"},
+              {"region": "ap-southeast-4", "instance_type": "trn2.3xlarge", "label": "Melbourne Trn2-3xl"},
+              {"region": "sa-east-1", "instance_type": "trn2.3xlarge", "label": "São Paulo Trn2-3xl"}
+            ]
+          DURATIONS: "[24, 48, 72, 168, 336, 504, 720]"
+      Code:
+        ZipFile: |
+          import boto3
+          import json
+          import os
+          from datetime import datetime, timezone, timedelta
+          from concurrent.futures import ThreadPoolExecutor, as_completed
+
+          def handler(event, context):
+              sns_topic_arn = os.environ['SNS_TOPIC_ARN']
+              targets = json.loads(os.environ['TARGETS'])
+              durations = json.loads(os.environ['DURATIONS'])
+              mode = event.get('mode', 'urgent')
+              
+              sns = boto3.client('sns', region_name='ap-northeast-2')
+              kst = timezone(timedelta(hours=9))
+              now_kst = datetime.now(kst).strftime('%Y-%m-%d %H:%M KST')
+              
+              MAX_INSTANCES = 64
+              
+              def binary_search_max(region, instance_type, duration_hours):
+                  ec2 = boto3.client('ec2', region_name=region)
+                  lo, hi, best = 1, MAX_INSTANCES, 0
+                  now = datetime.now(timezone.utc)
+                  while lo <= hi:
+                      mid = (lo + hi) // 2
+                      try:
+                          resp = ec2.describe_capacity_block_offerings(
+                              InstanceType=instance_type,
+                              InstanceCount=mid,
+                              CapacityDurationHours=duration_hours,
+                              StartDateRange=now,
+                          )
+                          if resp.get('CapacityBlockOfferings', []):
+                              best = mid
+                              lo = mid + 1
+                          else:
+                              hi = mid - 1
+                      except Exception:
+                          hi = mid - 1
+                  return best
+              
+              def probe_target(target):
+                  region = target['region']
+                  instance_type = target['instance_type']
+                  label = target['label']
+                  
+                  ec2 = boto3.client('ec2', region_name=region)
+                  now = datetime.now(timezone.utc)
+                  
+                  # Initial offering check
+                  all_offerings = []
+                  for hours in durations:
+                      try:
+                          response = ec2.describe_capacity_block_offerings(
+                              InstanceType=instance_type,
+                              InstanceCount=1,
+                              CapacityDurationHours=hours,
+                              StartDateRange=now,
+                          )
+                          offerings = response.get('CapacityBlockOfferings', [])
+                          for o in offerings:
+                              o['QueriedDurationHours'] = hours
+                              all_offerings.append(o)
+                      except Exception:
+                          pass
+                  
+                  # Binary search all durations
+                  max_counts = {}
+                  for dur in durations:
+                      max_counts[str(dur)] = binary_search_max(region, instance_type, dur)
+                  
+                  overall_max = max(max_counts.values()) if max_counts else 0
+                  
+                  # Find earliest start
+                  earliest_start_str = None
+                  if all_offerings:
+                      for o in sorted(all_offerings, key=lambda x: str(x.get('StartDate', ''))):
+                          s = o.get('StartDate', '')
+                          if s:
+                              try:
+                                  edt = datetime.fromisoformat(str(s).replace('+00:00', '+00:00'))
+                                  edt_kst = edt + timedelta(hours=9)
+                                  earliest_start_str = edt_kst.strftime('%m/%d(%a) %H:%M KST')
+                              except:
+                                  pass
+                              break
+                  
+                  return {
+                      'label': label,
+                      'region': region,
+                      'instance_type': instance_type,
+                      'overall_max': overall_max,
+                      'max_counts': max_counts,
+                      'earliest_start': earliest_start_str,
+                      'offerings': all_offerings,
+                  }
+              
+              # Parallel probe all targets
+              results = []
+              with ThreadPoolExecutor(max_workers=4) as executor:
+                  futures = {executor.submit(probe_target, t): t for t in targets}
+                  for future in as_completed(futures):
+                      try:
+                          results.append(future.result())
+                      except Exception as e:
+                          t = futures[future]
+                          results.append({'label': t['label'], 'overall_max': 0, 'error': str(e)})
+              
+              # Sort by label for consistent ordering
+              results.sort(key=lambda x: x['label'])
+              
+              # Filter for urgent mode: only include targets with offerings starting within 7 days
+              if mode == 'urgent':
+                  now_utc = datetime.now(timezone.utc)
+                  seven_days_later = now_utc + timedelta(days=7)
+                  urgent_results = []
+                  for r in results:
+                      if r.get('overall_max', 0) > 0:
+                          has_urgent = False
+                          for o in r.get('offerings', []):
+                              try:
+                                  start = datetime.fromisoformat(str(o.get('StartDate', '')).replace('+00:00', '+00:00'))
+                                  if start <= seven_days_later:
+                                      has_urgent = True
+                                      break
+                              except:
+                                  has_urgent = True
+                          if has_urgent:
+                              urgent_results.append(r)
+                  if not urgent_results:
+                      print(f"No urgent offerings. Skipping.")
+                      return {'statusCode': 200, 'body': json.dumps({'status': 'NO_URGENT'})}
+                  results = urgent_results
+              
+              # Check if anything to report
+              if not any(r.get('overall_max', 0) > 0 for r in results):
+                  print("No availability across all targets.")
+                  return {'statusCode': 200, 'body': json.dumps({'status': 'NO_OFFERINGS'})}
+              
+              # Build message
+              lines = []
+              if mode == 'daily_summary':
+                  lines.append("\U0001f4cb CB Daily Summary")
+                  lines.append(f"\U0001f550 {now_kst}")
+                  lines.append("\u2501" * 18)
+                  lines.append("")
+                  
+                  for r in results:
+                      overall = r.get('overall_max', 0)
+                      label = r.get('label', '?')
+                      lines.append(f"\U0001f4cd {label}")
+                      lines.append(f"   \U0001f5a5\ufe0f \uac00\uc6a9: {overall}\ub300")
+                      if r.get('earliest_start'):
+                          lines.append(f"   \U0001f4c5 \uc2dc\uc791: {r['earliest_start']}")
+                      # Duration breakdown
+                      mc = r.get('max_counts', {})
+                      dur_parts = []
+                      for dur in durations:
+                          count = mc.get(str(dur), 0)
+                          if count > 0:
+                              days = dur // 24
+                              dur_parts.append(f"{days}d:{count}")
+                      if dur_parts:
+                          lines.append(f"   [{', '.join(dur_parts)}]")
+                      lines.append("")
+                  
+                  lines.append("\u2501" * 18)
+              else:
+                  # Urgent: compact format
+                  lines.append("\U0001f514 CB Alert")
+                  lines.append(f"\U0001f550 {now_kst}")
+                  lines.append("\u2501" * 18)
+                  for r in results:
+                      overall = r.get('overall_max', 0)
+                      if overall > 0:
+                          label = r.get('label', '?')
+                          start = r.get('earliest_start', '?')
+                          lines.append(f"\U0001f4cd {label}: {overall}\ub300 | \uc2dc\uc791: {start}")
+                  lines.append("\u2501" * 18)
+              
+              description = "\n".join(lines)
+              message = json.dumps({"version": "1.0", "source": "custom", "content": {"description": description}})
+              
+              sns.publish(
+                  TopicArn=sns_topic_arn,
+                  Subject=f"{'\U0001f4cb' if mode == 'daily_summary' else '\U0001f514'} CB Monitor",
+                  Message=message,
+              )
+              
+              print(f"ALERT SENT: mode={mode}, targets={len(results)}")
+              return {'statusCode': 200, 'body': json.dumps({'status': 'ALERT_SENT', 'targets': len(results)})}
+
+  ScheduleRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: gpu-cb-monitor-schedule
+      Description: "Check CB availability (urgent - every 30 min)"
+      ScheduleExpression: !Sub "rate(${CheckIntervalMinutes} minutes)"
+      State: ENABLED
+      Targets:
+        - Id: CBMonitorLambda
+          Arn: !GetAtt CBMonitorFunction.Arn
+          Input: '{"mode": "urgent"}'
+
+  LambdaInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CBMonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ScheduleRule.Arn
+
+  DailySummaryRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: gpu-cb-daily-summary
+      Description: "Daily CB summary at 9 AM KST (00:00 UTC)"
+      ScheduleExpression: "cron(0 0 * * ? *)"
+      State: ENABLED
+      Targets:
+        - Id: CBMonitorLambdaDaily
+          Arn: !GetAtt CBMonitorFunction.Arn
+          Input: '{"mode": "daily_summary"}'
+
+  DailySummaryPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref CBMonitorFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt DailySummaryRule.Arn
