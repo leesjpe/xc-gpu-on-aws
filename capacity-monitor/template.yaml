@@ -7,8 +7,8 @@ Description: >
 Parameters:
   SnsTopicArn:
     Type: String
-    Default: "arn:aws:sns:ap-northeast-2:019036800568:gpu-cb-alert-icn"
-    Description: "Cross-account SNS Topic ARN (in 019036800568)"
+    Default: "arn:aws:sns:ap-northeast-2:[account-number]:gpu-cb-alert-icn"
+    Description: "Cross-account SNS Topic ARN (in [account-number])"
   CheckIntervalMinutes:
     Type: Number
     Default: 240
